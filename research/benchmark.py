@@ -316,9 +316,17 @@ def negative_sampler(freqs: np.ndarray, power: float = 0.75):
 class SkipGramNS(nn.Module):
     """Two embedding tables: input (center) and output (context)."""
 
-    def __init__(self, vocab_size: int, dim: int) -> None:
+    def __init__(self, vocab_size: int, dim: int, activation=None) -> None:
+        super().__init__()
         self.in_emb = nn.Embedding(vocab_size, dim)
         self.out_emb = nn.Embedding(vocab_size, dim)
+        self.activation = activation
+
+    def transform(self, x):
+        if self.activation is None:
+            return x
+
+        return self.activation(x)
 
 
 def log_sigmoid(x: cpu.Tensor) -> cpu.Tensor:
@@ -326,15 +334,60 @@ def log_sigmoid(x: cpu.Tensor) -> cpu.Tensor:
     return (((-x).exp() + 1.0) ** -1.0).log()
 
 
-def ns_loss(model: SkipGramNS, centers, contexts, negatives, dim: int) -> cpu.Tensor:
-    """Skip-gram negative-sampling loss for one batch (one graph, one backward)."""
+def make_frozen_mixture(pi_relu, pi_gelu, pi_silu):
+    """
+    Create a frozen linear mixture of ReLU, GELU and SiLU.
+
+    The coefficients are constants, not trainable parameters.
+    """
+
+    pi_relu = float(pi_relu)
+    pi_gelu = float(pi_gelu)
+    pi_silu = float(pi_silu)
+
+    class FrozenMixture:
+        def __call__(self, x):
+            relu = x.relu()
+            gelu = x.gelu()
+            sigmoid = 1.0 / (1.0 + (-x).exp())
+            silu = x * sigmoid
+
+            return (
+                pi_relu * relu
+                + pi_gelu * gelu
+                + pi_silu * silu
+            )
+
+    return FrozenMixture()
+
+
+def ns_loss(
+    model: SkipGramNS,
+    centers,
+    contexts,
+    negatives,
+    dim: int,
+) -> cpu.Tensor:
+    """Skip-gram negative-sampling loss with optional frozen activation."""
+
     b = centers.shape[0]
-    v = model.in_emb(centers)
-    u_pos = model.out_emb(contexts)
-    u_neg = model.out_emb(negatives)
+
+    # Apply the same activation to center and context embeddings.
+    v = model.transform(model.in_emb(centers))
+    u_pos = model.transform(model.out_emb(contexts))
+    u_neg = model.transform(model.out_emb(negatives))
+
     pos_score = (v * u_pos).sum(axis=1)
-    neg_score = (u_neg * v.reshape(b, 1, dim)).sum(axis=2)
-    total = log_sigmoid(pos_score).sum() + log_sigmoid(-neg_score).sum()
+
+    neg_score = (
+        u_neg * v.reshape(b, 1, dim)
+    ).sum(axis=2)
+
+    total = (
+        log_sigmoid(pos_score).sum()
+        + log_sigmoid(-neg_score).sum()
+    )
+
     return -total / b
 
 
@@ -393,6 +446,7 @@ def run_sgns(
     opt_factory: Callable = lambda params, lr: optim.Adam(params, lr=lr),
     name: str = "sgns",
     verbose: bool = False,
+    activation_factory=None,
 ) -> Result:
     """Train word2vec (skip-gram + negative sampling) on *Flatland*.
 
@@ -405,11 +459,25 @@ def run_sgns(
     word2id, id2word, freqs, centers, contexts = flatland_pairs(min_count, window)
     sample_negatives = negative_sampler(freqs)
 
-    model = SkipGramNS(len(word2id), dim)
-    if tie_tables:                       # one table playing both roles
+    activation = (
+        activation_factory()
+        if activation_factory is not None
+        else None
+    )
+
+    model = SkipGramNS(
+        len(word2id),
+        dim,
+        activation=activation,
+    )
+
+
+    if tie_tables:
         model.out_emb = model.in_emb
 
-    vecs, labels, _ = representative_vectors(model.in_emb.weight.data, word2id)
+    initial_embeddings = model.transform(model.in_emb.weight.data)
+
+    vecs, labels, _ = representative_vectors(initial_embeddings,word2id)
     before = silhouette_score(vecs, labels)
 
     opt = opt_factory(model.parameters(), lr)
@@ -435,8 +503,10 @@ def run_sgns(
             print(f"   epoch {epoch}/{epochs}   mean loss = {running / n_batches:+.3f}")
 
     seconds = time.time() - started
-    vecs, labels, _ = representative_vectors(model.in_emb.weight.data, word2id)
+    final_embeddings = model.transform(model.in_emb.weight.data)
+    vecs, labels, _ = representative_vectors(final_embeddings,word2id)
     after = silhouette_score(vecs, labels)
+
 
     return Result(
         name=name,
@@ -527,7 +597,7 @@ def pareto(results: Sequence[Result], *, cost: str = "train_flops",
     for r in results:
         groups.setdefault(r.name, []).append(r)
 
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    fig, ax = plt.subplots(figsize=(9, 5.5))
     for cfg, rows in groups.items():
         xs = [getattr(r, cost) for r in rows]
         ys = [r.score for r in rows]
